@@ -1,5 +1,5 @@
 # ====================================================================
-# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL Y ROBUSTA)
+# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL Y ROBUSTA v3)
 # ====================================================================
 
 import streamlit as st
@@ -13,9 +13,9 @@ st.set_page_config(layout="wide")
 
 # ====================================================================
 ### ➡️ CONFIGURACIÓN DE HOJAS
-# El conector de Streamlit usará la URL/ID que definiste en 'Secrets'
 # ====================================================================
 
+# Nombres de las hojas de trabajo (Worksheets)
 INVENTARIO_SHEET_NAME = 'Inventario' 
 VENTAS_SHEET_NAME = 'Ventas'
 
@@ -34,29 +34,31 @@ VENTAS_COLS = [
 
 @st.cache_resource
 def get_gs_connection():
-    # Inicializa la conexión a Google Sheets usando el conector nativo de Streamlit.
-    # El tipo 'gsheets' es correcto. El error anterior fue interno.
+    """Inicializa la conexión forzando el uso del conector instalado."""
     try:
+        # Usamos el nombre 'gsheets' que es el estándar, pero ahora Streamlit tiene el paquete disponible
         conn = st.connection("gsheet", type="gsheets")
         return conn
     except Exception as e:
-        st.error(f"❌ Error de Conexión. Asegúrate de configurar la clave 'spreadsheet_id' en Streamlit Secrets bajo [connections.gsheet]. Detalle: {e}")
+        st.error(f"❌ Error de Conexión. Asegúrate de configurar la clave 'spreadsheet_id' en Streamlit Secrets bajo [connections.gsheet] y que el archivo 'requirements.txt' tenga 'st-gsheets-connection'. Detalle: {e}")
         st.stop()
 
+@st.cache_data(ttl=5) # Cache de 5 segundos para relecturas
 def read_sheet_to_df(sheet_name, expected_cols):
     """Lee una hoja de cálculo por nombre de hoja y la convierte a DataFrame."""
     conn = get_gs_connection()
     try:
         # Lee la hoja con la primera fila como encabezado
-        df = conn.read(worksheet=sheet_name, usecols=expected_cols, ttl=5)
+        df = conn.read(worksheet=sheet_name, usecols=expected_cols, ttl=0) # ttl=0 para forzar la relectura al llamar
         
-        # Si el DataFrame está vacío (solo encabezados), crea uno vacío con las columnas esperadas
         if df.empty:
+            # Si el DF está vacío (o solo tiene encabezados), devolvemos un DF vacío con las columnas esperadas
             return pd.DataFrame(columns=expected_cols)
             
         return df
     except Exception as e:
-        st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista y que los permisos estén configurados. Detalle: {e}")
+        # No detenemos la app si hay error de lectura, solo mostramos el error
+        st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista. Detalle: {e}")
         return pd.DataFrame(columns=expected_cols)
 
 def write_df_to_sheet(sheet_name, df, expected_cols):
@@ -69,7 +71,7 @@ def write_df_to_sheet(sheet_name, df, expected_cols):
         conn.write(worksheet=sheet_name, data=df_to_write)
         st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
     except Exception as e:
-        st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor' para cualquier usuario con el enlace. Detalle: {e}")
+        st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor'. Detalle: {e}")
         st.stop()
 
 def clean_input(text):
@@ -99,7 +101,6 @@ def parse_price(value):
 def load_data():
     """Carga los datos desde Google Sheets y aplica la limpieza de tipos."""
     
-    # Intenta leer los datos
     inventario_df = read_sheet_to_df(INVENTARIO_SHEET_NAME, INVENTARIO_COLS)
     ventas_df = read_sheet_to_df(VENTAS_SHEET_NAME, VENTAS_COLS)
 
@@ -107,7 +108,6 @@ def load_data():
         # Limpieza de tipos y manejo de valores numéricos para Inventario
         inventario_df['CANTIDAD_ACTUAL'] = pd.to_numeric(inventario_df['CANTIDAD_ACTUAL'], errors='coerce').fillna(0).astype(int)
         for col in ['COSTO_UNITARIO', 'PRECIO_BASE', 'PRECIO_PUBLICO']:
-            # Asegura que aplicamos parse_price a cada columna
             inventario_df[col] = inventario_df[col].apply(parse_price)
             
     if not ventas_df.empty:
@@ -118,7 +118,8 @@ def load_data():
                  ventas_df[col] = ventas_df[col].fillna(0).astype(int)
         
         # Asegurar que la columna de fecha sea tipo string para evitar problemas de formato
-        ventas_df['FECHA_HORA'] = ventas_df['FECHA_HORA'].astype(str)
+        if 'FECHA_HORA' in ventas_df.columns:
+            ventas_df['FECHA_HORA'] = ventas_df['FECHA_HORA'].astype(str)
 
     return inventario_df, ventas_df
 
@@ -184,7 +185,6 @@ def registrar_venta(inventario_df, ventas_df, nombre_producto, cantidad, tipo_cl
     }).to_frame().T
     
     # Añadimos la nueva venta al principio del DataFrame de Ventas (más fácil de ver)
-    # Utilizamos pd.concat de forma segura para DataFrames
     ventas_df = pd.concat([registro_venta, ventas_df], ignore_index=True)
     
     # Actualización de Stock
