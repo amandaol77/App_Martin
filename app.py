@@ -1,5 +1,5 @@
 # ====================================================================
-# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL gspread ROBUSTA v4)
+# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: aplicación.py (VERSIÓN FINAL gspread ROBUSTA v4)
 # ====================================================================
 
 import streamlit as st
@@ -18,8 +18,10 @@ st.set_page_config(layout="wide")
 ### ➡️ CONFIGURACIÓN DE HOJAS
 # ====================================================================
 
+# El ID de la hoja de cálculo de Martin (compartida contigo)
+SPREADSHEET_ID = "1G6V65-y81QryxPV6qKZBX4ClccTrVYbAAB7FBT9tuKk" 
+
 # Nombres de las hojas de trabajo (Worksheets)
-SPREADSHEET_ID = "1G6V65-y81QryxPV6qKZBX4ClccTrVYbAAB7FBT9tuKk" # ID de tu hoja
 INVENTARIO_SHEET_NAME = 'Inventario' 
 VENTAS_SHEET_NAME = 'Ventas'
 
@@ -47,6 +49,7 @@ def get_gspread_client():
         SERVICE_ACCOUNT_JSON = st.secrets["gserviceaccount"]
         
         # Convertir el string JSON en un diccionario (ServiceAccountCredentials lo necesita)
+        # Usamos json.loads para manejar el JSON de los secrets
         creds_json = json.loads(SERVICE_ACCOUNT_JSON)
         
         # Usamos el scope para leer y escribir
@@ -70,6 +73,7 @@ def get_gspread_client():
         st.stop()
 
 
+@st.cache_data(ttl=5) # Cache de 5 segundos para relecturas
 def read_sheet_to_df(sheet_name, expected_cols):
     """Lee una hoja de cálculo por nombre de hoja y la convierte a DataFrame."""
     try:
@@ -78,17 +82,17 @@ def read_sheet_to_df(sheet_name, expected_cols):
         
         # Obtener todos los valores y convertirlos a DataFrame
         data = worksheet.get_all_records()
-        df = pd.DataFrame(data, columns=expected_cols)
+        df = pd.DataFrame(data)
         
         if df.empty or len(df.columns) == 0:
              return pd.DataFrame(columns=expected_cols)
 
-        # Rellenar cualquier columna faltante con NaN para evitar errores
+        # Rellenar cualquier columna faltante con NaN y asegurar el orden correcto
         for col in expected_cols:
             if col not in df.columns:
                 df[col] = pd.NA
 
-        return df[expected_cols] # Asegura el orden correcto
+        return df[expected_cols] 
         
     except Exception as e:
         st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista y que la Service Account tenga permisos de Editor. Detalle: {e}")
@@ -109,6 +113,7 @@ def write_df_to_sheet(sheet_name, df, expected_cols):
         
         # Escribir todos los datos
         worksheet.clear() # Limpia la hoja
+        # A1 es la celda de inicio para la escritura
         worksheet.update('A1', data_to_write)
         
         st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
@@ -116,7 +121,7 @@ def write_df_to_sheet(sheet_name, df, expected_cols):
         st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor' para la Service Account. Detalle: {e}")
         st.stop()
 
-# --- Resto de las funciones (clean_input, parse_price, load_data, save_data, generar_sku, registrar_venta) se mantienen igual ---
+# --- FUNCIONES DE UTILIDAD ---
 
 def clean_input(text):
     """Limpia el texto, elimina tildes/ñ y convierte a mayúsculas para la búsqueda."""
@@ -145,20 +150,24 @@ def parse_price(value):
 def load_data():
     """Carga los datos desde Google Sheets y aplica la limpieza de tipos."""
     
+    # Intenta leer los datos (usa cache)
     inventario_df = read_sheet_to_df(INVENTARIO_SHEET_NAME, INVENTARIO_COLS)
     ventas_df = read_sheet_to_df(VENTAS_SHEET_NAME, VENTAS_COLS)
 
     if not inventario_df.empty:
+        # Limpieza de tipos y manejo de valores numéricos para Inventario
         inventario_df['CANTIDAD_ACTUAL'] = pd.to_numeric(inventario_df['CANTIDAD_ACTUAL'], errors='coerce').fillna(0).astype(int)
         for col in ['COSTO_UNITARIO', 'PRECIO_BASE', 'PRECIO_PUBLICO']:
             inventario_df[col] = inventario_df[col].apply(parse_price)
             
     if not ventas_df.empty:
+        # Limpieza de tipos y manejo de valores numéricos para Ventas
         for col in ['CANTIDAD_UNIDADES', 'PRECIO_VENTA_FINAL', 'COSTO_DEL_PRODUCTO_TOTAL', 'GASTOS_DIRECTOS_VIAJE', 'GANANCIA_NETA']:
             ventas_df[col] = ventas_df[col].apply(parse_price)
             if col == 'CANTIDAD_UNIDADES':
                  ventas_df[col] = ventas_df[col].fillna(0).astype(int)
         
+        # Asegurar que la columna de fecha sea tipo string para evitar problemas de formato
         if 'FECHA_HORA' in ventas_df.columns:
             ventas_df['FECHA_HORA'] = ventas_df['FECHA_HORA'].astype(str)
 
@@ -166,6 +175,8 @@ def load_data():
 
 def save_data(inventario_df, ventas_df):
     """Guarda ambos DataFrames en Google Sheets."""
+    # Invalidamos el cache para que la próxima lectura sea fresca
+    st.cache_data.clear()
     write_df_to_sheet(INVENTARIO_SHEET_NAME, inventario_df, INVENTARIO_COLS) 
     write_df_to_sheet(VENTAS_SHEET_NAME, ventas_df, VENTAS_COLS)
     st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
@@ -302,6 +313,7 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
     
     if st.button("REGISTRAR VENTA y ACTUALIZAR INVENTARIO", type="primary"):
         if producto_seleccionado not in ('Seleccione un Producto', '') and precio_final > 0:
+            # Recargamos para evitar conflictos si alguien más cambió la hoja
             st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data() 
             
             st.session_state['inventario_df'], st.session_state['ventas_df'], exito = registrar_venta(
@@ -430,10 +442,12 @@ def main():
         st.markdown("---")
         st.markdown("**Ganancia Neta es el resultado de: Venta - Costo - Gastos**")
         
+        # Recargar datos antes de reportes para tener la información más actual
         st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data()
         
         ventas_df_clean = st.session_state['ventas_df'].copy()
         
+        # Formatear para la visualización
         ventas_df_clean['GANANCIA_NETA_DISPLAY'] = ventas_df_clean['GANANCIA_NETA'].apply(lambda x: f"${x:,.2f}")
         ventas_df_clean['PRECIO_VENTA_FINAL_DISPLAY'] = ventas_df_clean['PRECIO_VENTA_FINAL'].apply(lambda x: f"${x:,.2f}")
         
