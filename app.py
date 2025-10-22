@@ -1,14 +1,11 @@
 # ====================================================================
-# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL EN LA NUBE)
+# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL Y ROBUSTA)
 # ====================================================================
 
 import streamlit as st
 import pandas as pd
-import gspread 
 import uuid
 from datetime import datetime
-import os
-import re
 import unidecode 
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
@@ -16,11 +13,12 @@ st.set_page_config(layout="wide")
 
 # ====================================================================
 ### ➡️ TUS ENLACES DE GOOGLE SHEETS AQUÍ (¡CRÍTICO!)
-# INSERTADOS AUTOMÁTICAMENTE: NO TOCAR
+# Nota: Ahora solo necesitamos los nombres de las hojas dentro de tu documento de Google
 # ====================================================================
 
-INVENTARIO_URL = 'https://docs.google.com/spreadsheets/d/1G6V65-y81QryxPV6qKZBX4ClccTrVYbAAB7FBT9tuKk/edit?usp=drivesdk' 
-VENTAS_URL = 'https://docs.google.com/spreadsheets/d/1XwYeFGGBF9M2CuY3-8nBUnyzkqsR1U_xEpHxrmHOqR4/edit?usp=drivesdk'
+# El conector de Streamlit usará la URL que definiremos en el paso 2
+INVENTARIO_SHEET_NAME = 'Inventario' 
+VENTAS_SHEET_NAME = 'Ventas'
 
 # Columnas Requeridas
 INVENTARIO_COLS = [
@@ -36,49 +34,47 @@ VENTAS_COLS = [
 # --- FUNCIONES DE CONEXIÓN Y DATOS ---
 
 @st.cache_resource
-def get_gc_connection():
+def get_gs_connection():
+    # Inicializa la conexión a Google Sheets usando el conector nativo de Streamlit
+    # Streamlit buscará el ID de la hoja en el paso 2 (secrets.toml)
     try:
-        # Esto usará la conexión pública/anónima de gspread
-        gc = gspread.service_account_anonymous()
-        return gc
+        conn = st.connection("gsheet", type=st.secrets.get("gsheet_type", "gsheets"))
+        return conn
     except Exception as e:
-        st.error(f"❌ Error de Conexión a Google Sheets: {e}")
+        st.error(f"❌ Error de Conexión. Asegúrate de configurar la clave 'sheet_id' en Streamlit Secrets. Error: {e}")
         st.stop()
-        
-def read_sheet_to_df(url, sheet_name=0):
-    """Lee una hoja de cálculo por URL y la convierte a DataFrame."""
-    gc = get_gc_connection()
-    try:
-        sh = gc.open_by_url(url)
-        # Selecciona la primera hoja de trabajo (por defecto)
-        worksheet = sh.sheet1
-        data = worksheet.get_all_values()
-        
-        if not data:
-            if url == INVENTARIO_URL:
-                 return pd.DataFrame(columns=INVENTARIO_COLS)
-            else:
-                 return pd.DataFrame(columns=VENTAS_COLS)
 
-        headers = data[0]
-        df = pd.DataFrame(data[1:], columns=headers)
+def read_sheet_to_df(sheet_name, expected_cols):
+    """Lee una hoja de cálculo por nombre de hoja y la convierte a DataFrame."""
+    conn = get_gs_connection()
+    try:
+        # Lee la hoja con la primera fila como encabezado
+        df = conn.read(worksheet=sheet_name, usecols=expected_cols, ttl=5)
+        
+        # Si el DataFrame está vacío (solo encabezados), crea uno vacío con las columnas esperadas
+        if df.empty and not conn.read(worksheet=sheet_name, ttl=0).empty:
+            return pd.DataFrame(columns=expected_cols)
+
+        # Si la lectura fue exitosa pero sin datos, devuelve un DF vacío
+        if df.empty:
+            return pd.DataFrame(columns=expected_cols)
+            
         return df
     except Exception as e:
-        st.error(f"❌ ERROR al leer los datos de Google Sheets. Verifique que los enlaces sean correctos y que la hoja exista: {e}")
-        st.stop()
+        st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista y que los permisos estén configurados. Detalle: {e}")
+        return pd.DataFrame(columns=expected_cols)
 
-def write_df_to_sheet(url, df):
+def write_df_to_sheet(sheet_name, df, expected_cols):
     """Escribe un DataFrame completo a una hoja de cálculo, reemplazando todo."""
-    gc = get_gc_connection()
+    conn = get_gs_connection()
+    # Aseguramos que solo guardamos las columnas correctas en el orden correcto
+    df_to_write = df[[c for c in expected_cols if c in df.columns]]
+    
     try:
-        sh = gc.open_by_url(url)
-        worksheet = sh.sheet1
-        data = [df.columns.values.tolist()] + df.values.tolist()
-        worksheet.clear()
-        worksheet.update(data)
+        conn.write(worksheet=sheet_name, data=df_to_write)
         st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
     except Exception as e:
-        st.error(f"❌ ERROR al guardar los datos en Google Sheets. ¿El permiso de la hoja es 'Editor' para cualquier usuario con el enlace?: {e}")
+        st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor' para cualquier usuario con el enlace. Detalle: {e}")
         st.stop()
 
 def clean_input(text):
@@ -94,10 +90,8 @@ def parse_price(value):
         return 0.0
     try:
         if isinstance(value, str):
-            # Elimina el punto de mil (ej: 2.000,50 -> 2000,50)
-            value = value.replace('.', '') 
-            # Reemplaza la coma decimal por punto (ej: 2000,50 -> 2000.50)
-            value = value.replace(',', '.')
+            value = value.replace('.', '') # Elimina punto de mil
+            value = value.replace(',', '.') # Reemplaza coma decimal por punto
         
         return float(value)
     except:
@@ -110,28 +104,31 @@ def parse_price(value):
 def load_data():
     """Carga los datos desde Google Sheets y aplica la limpieza de tipos."""
     
-    inventario_df = read_sheet_to_df(INVENTARIO_URL)
-    ventas_df = read_sheet_to_df(VENTAS_URL)
+    inventario_df = read_sheet_to_df(INVENTARIO_SHEET_NAME, INVENTARIO_COLS)
+    ventas_df = read_sheet_to_df(VENTAS_SHEET_NAME, VENTAS_COLS)
 
     if not inventario_df.empty:
+        # Limpieza de tipos y manejo de valores numéricos
         inventario_df['CANTIDAD_ACTUAL'] = pd.to_numeric(inventario_df['CANTIDAD_ACTUAL'], errors='coerce').fillna(0).astype(int)
-        inventario_df['COSTO_UNITARIO'] = inventario_df['COSTO_UNITARIO'].apply(parse_price)
-        inventario_df['PRECIO_BASE'] = inventario_df['PRECIO_BASE'].apply(parse_price)
-        inventario_df['PRECIO_PUBLICO'] = inventario_df['PRECIO_PUBLICO'].apply(parse_price)
-        
+        for col in ['COSTO_UNITARIO', 'PRECIO_BASE', 'PRECIO_PUBLICO']:
+            inventario_df[col] = inventario_df[col].apply(parse_price)
+            
     if not ventas_df.empty:
+        # Limpieza de tipos y manejo de valores numéricos para Ventas
         for col in ['CANTIDAD_UNIDADES', 'PRECIO_VENTA_FINAL', 'COSTO_DEL_PRODUCTO_TOTAL', 'GASTOS_DIRECTOS_VIAJE', 'GANANCIA_NETA']:
             ventas_df[col] = ventas_df[col].apply(parse_price)
             if col == 'CANTIDAD_UNIDADES':
                  ventas_df[col] = ventas_df[col].fillna(0).astype(int)
+        
+        # Asegurar que la columna de fecha sea tipo string para evitar problemas de formato
+        ventas_df['FECHA_HORA'] = ventas_df['FECHA_HORA'].astype(str)
 
     return inventario_df, ventas_df
 
 def save_data(inventario_df, ventas_df):
     """Guarda ambos DataFrames en Google Sheets."""
-    # Aseguramos que solo guardamos las columnas correctas en el orden correcto
-    write_df_to_sheet(INVENTARIO_URL, inventario_df[[c for c in INVENTARIO_COLS if c in inventario_df.columns]]) 
-    write_df_to_sheet(VENTAS_URL, ventas_df[[c for c in VENTAS_COLS if c in ventas_df.columns]])
+    write_df_to_sheet(INVENTARIO_SHEET_NAME, inventario_df, INVENTARIO_COLS) 
+    write_df_to_sheet(VENTAS_SHEET_NAME, ventas_df, VENTAS_COLS)
     st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
 
 def generar_sku(nombre):
@@ -168,7 +165,7 @@ def registrar_venta(inventario_df, ventas_df, nombre_producto, cantidad, tipo_cl
         st.warning(f"❌ Stock insuficiente. Solo quedan {cantidad_actual} unidades.")
         return inventario_df, ventas_df, False
 
-    costo_unitario = pd.to_numeric(producto['COSTO_UNITARIO'])
+    costo_unitario = parse_price(producto['COSTO_UNITARIO'])
     costo_total_venta = costo_unitario * cantidad
     
     codigo_sku = producto['CODIGO_SKU'] 
@@ -249,9 +246,9 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
         
         if producto_encontrado is not None:
             if tipo_cliente == 'Mayorista':
-                precio_sugerido_display = producto_encontrado['PRECIO_BASE']
+                precio_sugerido_display = parse_price(producto_encontrado['PRECIO_BASE'])
             else: 
-                precio_sugerido_display = producto_encontrado['PRECIO_PUBLICO']
+                precio_sugerido_display = parse_price(producto_encontrado['PRECIO_PUBLICO'])
                 
         # Usamos el input de texto para el precio, permitiendo el formato "punto de mil"
         precio_final_str = st.text_input("4. Precio Final $", value=f"{precio_sugerido_display:,.0f}" if precio_sugerido_display else "0")
