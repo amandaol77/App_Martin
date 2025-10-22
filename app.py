@@ -1,5 +1,5 @@
 # ====================================================================
-# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL Y ROBUSTA v3)
+# ARCHIVO PRINCIPAL DE LA APLICACIÓN WEB: app.py (VERSIÓN FINAL gspread ROBUSTA v4)
 # ====================================================================
 
 import streamlit as st
@@ -7,6 +7,9 @@ import pandas as pd
 import uuid
 from datetime import datetime
 import unidecode 
+import gspread # Necesario para la conexión directa
+import json # Necesario para procesar el JSON de secrets
+from oauth2client.service_account import ServiceAccountCredentials # Necesario para credenciales
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(layout="wide")
@@ -16,6 +19,7 @@ st.set_page_config(layout="wide")
 # ====================================================================
 
 # Nombres de las hojas de trabajo (Worksheets)
+SPREADSHEET_ID = "1G6V65-y81QryxPV6qKZBX4ClccTrVYbAAB7FBT9tuKk" # ID de tu hoja
 INVENTARIO_SHEET_NAME = 'Inventario' 
 VENTAS_SHEET_NAME = 'Ventas'
 
@@ -32,47 +36,87 @@ VENTAS_COLS = [
 
 # --- FUNCIONES DE CONEXIÓN Y DATOS ---
 
-@st.cache_resource
-def get_gs_connection():
-    """Inicializa la conexión forzando el uso del conector instalado."""
+@st.cache_resource(ttl=3600) # Cache por 1 hora
+def get_gspread_client():
+    """Conecta a Google Sheets usando el método directo de gspread + Service Account."""
+    
+    # Intentar cargar credenciales desde Streamlit Secrets
     try:
-        # Usamos el nombre 'gsheets' que es el estándar, pero ahora Streamlit tiene el paquete disponible
-        conn = st.connection("gsheet", type="gsheets")
-        return conn
+        # La clave de tu Service Account debe estar en Streamlit Secrets como texto JSON
+        # La clave en Secrets DEBE llamarse 'gserviceaccount'
+        SERVICE_ACCOUNT_JSON = st.secrets["gserviceaccount"]
+        
+        # Convertir el string JSON en un diccionario (ServiceAccountCredentials lo necesita)
+        creds_json = json.loads(SERVICE_ACCOUNT_JSON)
+        
+        # Usamos el scope para leer y escribir
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        
+        # Crear credenciales usando oauth2client
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+        
+        # Autorizar y obtener el cliente gspread
+        client = gspread.authorize(creds)
+        
+        # Abrir la hoja de cálculo por ID
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        return spreadsheet
+        
     except Exception as e:
-        st.error(f"❌ Error de Conexión. Asegúrate de configurar la clave 'spreadsheet_id' en Streamlit Secrets bajo [connections.gsheet] y que el archivo 'requirements.txt' tenga 'st-gsheets-connection'. Detalle: {e}")
+        # En caso de error, muestra un mensaje detallado para la configuración
+        st.error(f"""❌ Error Crítico de Conexión. Debe configurar una 'Service Account' (cuenta de servicio) de Google Sheets y subir el archivo JSON completo a Streamlit Secrets bajo la clave 'gserviceaccount' (texto JSON en una sola línea).
+        
+        Detalle: {e}""")
         st.stop()
 
-@st.cache_data(ttl=5) # Cache de 5 segundos para relecturas
+
 def read_sheet_to_df(sheet_name, expected_cols):
     """Lee una hoja de cálculo por nombre de hoja y la convierte a DataFrame."""
-    conn = get_gs_connection()
     try:
-        # Lee la hoja con la primera fila como encabezado
-        df = conn.read(worksheet=sheet_name, usecols=expected_cols, ttl=0) # ttl=0 para forzar la relectura al llamar
+        spreadsheet = get_gspread_client()
+        worksheet = spreadsheet.worksheet(sheet_name)
         
-        if df.empty:
-            # Si el DF está vacío (o solo tiene encabezados), devolvemos un DF vacío con las columnas esperadas
-            return pd.DataFrame(columns=expected_cols)
-            
-        return df
+        # Obtener todos los valores y convertirlos a DataFrame
+        data = worksheet.get_all_records()
+        df = pd.DataFrame(data, columns=expected_cols)
+        
+        if df.empty or len(df.columns) == 0:
+             return pd.DataFrame(columns=expected_cols)
+
+        # Rellenar cualquier columna faltante con NaN para evitar errores
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        return df[expected_cols] # Asegura el orden correcto
+        
     except Exception as e:
-        # No detenemos la app si hay error de lectura, solo mostramos el error
-        st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista. Detalle: {e}")
+        st.error(f"❌ ERROR al leer los datos de la hoja '{sheet_name}'. Verifique que la hoja exista y que la Service Account tenga permisos de Editor. Detalle: {e}")
         return pd.DataFrame(columns=expected_cols)
 
 def write_df_to_sheet(sheet_name, df, expected_cols):
     """Escribe un DataFrame completo a una hoja de cálculo, reemplazando todo."""
-    conn = get_gs_connection()
-    # Aseguramos que solo guardamos las columnas correctas en el orden correcto
-    df_to_write = df[[c for c in expected_cols if c in df.columns]]
     
     try:
-        conn.write(worksheet=sheet_name, data=df_to_write)
+        spreadsheet = get_gspread_client()
+        worksheet = spreadsheet.worksheet(sheet_name)
+        
+        # Aseguramos que solo guardamos las columnas correctas en el orden correcto
+        df_to_write = df[[c for c in expected_cols if c in df.columns]]
+        
+        # Convertir el DataFrame a una lista de listas (incluyendo encabezados)
+        data_to_write = [expected_cols] + df_to_write.astype(str).values.tolist()
+        
+        # Escribir todos los datos
+        worksheet.clear() # Limpia la hoja
+        worksheet.update('A1', data_to_write)
+        
         st.session_state['data_saved'] = datetime.now().strftime('%H:%M:%S')
     except Exception as e:
-        st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor'. Detalle: {e}")
+        st.error(f"❌ ERROR al guardar los datos en la hoja '{sheet_name}'. El permiso de la hoja debe ser 'Editor' para la Service Account. Detalle: {e}")
         st.stop()
+
+# --- Resto de las funciones (clean_input, parse_price, load_data, save_data, generar_sku, registrar_venta) se mantienen igual ---
 
 def clean_input(text):
     """Limpia el texto, elimina tildes/ñ y convierte a mayúsculas para la búsqueda."""
@@ -105,19 +149,16 @@ def load_data():
     ventas_df = read_sheet_to_df(VENTAS_SHEET_NAME, VENTAS_COLS)
 
     if not inventario_df.empty:
-        # Limpieza de tipos y manejo de valores numéricos para Inventario
         inventario_df['CANTIDAD_ACTUAL'] = pd.to_numeric(inventario_df['CANTIDAD_ACTUAL'], errors='coerce').fillna(0).astype(int)
         for col in ['COSTO_UNITARIO', 'PRECIO_BASE', 'PRECIO_PUBLICO']:
             inventario_df[col] = inventario_df[col].apply(parse_price)
             
     if not ventas_df.empty:
-        # Limpieza de tipos y manejo de valores numéricos para Ventas
         for col in ['CANTIDAD_UNIDADES', 'PRECIO_VENTA_FINAL', 'COSTO_DEL_PRODUCTO_TOTAL', 'GASTOS_DIRECTOS_VIAJE', 'GANANCIA_NETA']:
             ventas_df[col] = ventas_df[col].apply(parse_price)
             if col == 'CANTIDAD_UNIDADES':
                  ventas_df[col] = ventas_df[col].fillna(0).astype(int)
         
-        # Asegurar que la columna de fecha sea tipo string para evitar problemas de formato
         if 'FECHA_HORA' in ventas_df.columns:
             ventas_df['FECHA_HORA'] = ventas_df['FECHA_HORA'].astype(str)
 
@@ -184,10 +225,8 @@ def registrar_venta(inventario_df, ventas_df, nombre_producto, cantidad, tipo_cl
         'VENDEDOR_REGISTRA': vendedor
     }).to_frame().T
     
-    # Añadimos la nueva venta al principio del DataFrame de Ventas (más fácil de ver)
     ventas_df = pd.concat([registro_venta, ventas_df], ignore_index=True)
     
-    # Actualización de Stock
     inventario_df.loc[idx, 'CANTIDAD_ACTUAL'] -= cantidad
     
     st.success(f"✅ Venta de {cantidad} x '{nombre_producto}' registrada. Stock actualizado.")
@@ -209,7 +248,6 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
     if len(producto_busqueda) >= 3:
         search_cleaned = clean_input(producto_busqueda)
         
-        # Filtramos por Nombre de Producto o SKU, ignorando tildes y mayúsculas
         sugerencias = inventario_df[
             inventario_df['NOMBRE_PRODUCTO'].astype(str).apply(clean_input).str.contains(search_cleaned, na=False) |
             inventario_df['CODIGO_SKU'].astype(str).apply(clean_input).str.contains(search_cleaned, na=False)
@@ -248,7 +286,6 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
             else: 
                 precio_sugerido_display = parse_price(producto_encontrado['PRECIO_PUBLICO'])
                 
-        # Usamos el input de texto para el precio, permitiendo el formato "punto de mil"
         precio_final_str = st.text_input("4. Precio Final $", value=f"{precio_sugerido_display:,.0f}" if precio_sugerido_display else "0")
         precio_final = parse_price(precio_final_str)
 
@@ -258,16 +295,13 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
         
         vendedor = st.selectbox("6. Registrado por", ['Martin', 'Amanda', 'Otro']) 
         
-    # Mostrar info del producto
     if producto_seleccionado != 'Seleccione un Producto':
         st.info(f"SKU: **{sku}** | Stock: **{stock}** | Sugerido ({tipo_cliente}): **${precio_sugerido_display:,.2f}**")
     
     st.markdown("---")
     
-    # Botón de Registro
     if st.button("REGISTRAR VENTA y ACTUALIZAR INVENTARIO", type="primary"):
         if producto_seleccionado not in ('Seleccione un Producto', '') and precio_final > 0:
-            # Recargamos para evitar conflictos si alguien más cambió la hoja
             st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data() 
             
             st.session_state['inventario_df'], st.session_state['ventas_df'], exito = registrar_venta(
@@ -276,7 +310,7 @@ def mostrar_registro_ventas(inventario_df, ventas_df):
             )
             if exito:
                 save_data(st.session_state['inventario_df'], st.session_state['ventas_df'])
-                st.rerun() # Recarga para mostrar el stock actualizado
+                st.rerun() 
         elif producto_seleccionado in ('Seleccione un Producto', ''):
             st.error("Por favor, seleccione un producto o complete la búsqueda.")
         elif precio_final <= 0:
@@ -318,7 +352,6 @@ def mostrar_inventario(df):
     else:
         df_filtered = df
 
-    # Formatear las columnas de precios para la visualización
     df_display = df_filtered.copy()
     for col in ['COSTO_UNITARIO', 'PRECIO_BASE', 'PRECIO_PUBLICO']:
         df_display[col] = df_display[col].apply(lambda x: f"${x:,.2f}")
@@ -338,7 +371,6 @@ def mostrar_carga_masiva():
     
     if uploaded_file is not None:
         try:
-            # Intentar leer con separador coma. Si falla, intentar con punto y coma (solución a problemas de formato regional)
             try:
                 df_a_cargar = pd.read_csv(uploaded_file, sep=',', encoding='utf-8')
             except:
@@ -351,18 +383,15 @@ def mostrar_carga_masiva():
                 st.error(f"❌ ERROR: El archivo CSV debe contener TODAS las 7 columnas requeridas: {', '.join(required_cols_upload)}. Revise mayúsculas y guiones.")
                 return
             
-            # Limpieza y generación de IDs/SKUs
             df_a_cargar['ID_PRODUCTO'] = [str(uuid.uuid4())[:8] for _ in range(len(df_a_cargar))]
             df_a_cargar['CODIGO_SKU'] = df_a_cargar.apply(
                 lambda row: generar_sku(row['NOMBRE_PRODUCTO']) if pd.isna(row['CODIGO_SKU']) or str(row['CODIGO_SKU']).strip() == '' else row['CODIGO_SKU'], axis=1
             )
             
-            # Reordenamos las columnas al orden final del inventario
             df_a_cargar = df_a_cargar[INVENTARIO_COLS]
             
             st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data()
             
-            # Consolidar: Las nuevas entradas reemplazan a las antiguas si tienen el mismo NOMBRE_PRODUCTO
             inventario_df = pd.concat([st.session_state['inventario_df'], df_a_cargar], ignore_index=True)
             inventario_df.drop_duplicates(subset=['NOMBRE_PRODUCTO'], keep='last', inplace=True)
             inventario_df.reset_index(drop=True, inplace=True)
@@ -381,7 +410,7 @@ def main():
     if 'inventario_df' not in st.session_state:
         st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data()
     
-    st.title("⚙️ App de Negocio: Inventario y Ganancia (CLOUD READY ☁️)")
+    st.title("⚙️ App de Negocio: Inventario y Ganancia (FINAL ☁️)")
     
     page = st.sidebar.selectbox("MENÚ", ["Registro Rápido", "Carga Masiva", "Gestión de Inventario", "Reportes de Venta"])
 
@@ -401,12 +430,10 @@ def main():
         st.markdown("---")
         st.markdown("**Ganancia Neta es el resultado de: Venta - Costo - Gastos**")
         
-        # Recargar datos antes de reportes para tener la información más actual
         st.session_state['inventario_df'], st.session_state['ventas_df'] = load_data()
         
         ventas_df_clean = st.session_state['ventas_df'].copy()
         
-        # Formatear para la visualización
         ventas_df_clean['GANANCIA_NETA_DISPLAY'] = ventas_df_clean['GANANCIA_NETA'].apply(lambda x: f"${x:,.2f}")
         ventas_df_clean['PRECIO_VENTA_FINAL_DISPLAY'] = ventas_df_clean['PRECIO_VENTA_FINAL'].apply(lambda x: f"${x:,.2f}")
         
